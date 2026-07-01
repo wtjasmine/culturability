@@ -1,0 +1,694 @@
+# ============================================================
+# Mixed-effects logistic regression analysis
+# Viral culturability over time
+# SARS-CoV-2, influenza, and RSV
+# ============================================================
+#
+# This script reproduces the final analyses used in the manuscript:
+# 1. Linear mixed-effects logistic regression for each virus
+# 2. Model comparison: random intercept vs random intercept + random slope
+# 3. Model-derived predicted culture positivity curves
+# 4. Time-to-threshold estimates (<5% and <1%)
+# 5. Exploratory SARS-CoV-2 study-level covariate analyses
+# 6. Multivariable SARS-CoV-2 model
+# 7. Figures for overall virus-specific trajectories and specimen type
+#
+# Notes:
+# - The outcome is grouped binomial:
+#     cbind(Culture_positive, Culture_negative)
+# - Days_from_onset is modelled as a linear fixed effect.
+# - Replace the file paths below with your local or GitHub data paths.
+# ============================================================
+
+
+# ============================================================
+# 0. Load packages
+# ============================================================
+
+library(readxl)
+library(dplyr)
+library(ggplot2)
+library(lme4)
+
+
+# ============================================================
+# 1. Define file paths
+# ============================================================
+
+sars_file <- "data/sars_cov_2/sarscov2data_template.xlsx"
+flu_file  <- "data/influenza/influenza_data_analyse.xlsx"
+rsv_file  <- "data/rsv/rsv_data_template.xlsx"
+
+output_dir <- "outputs"
+
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+
+# ============================================================
+# 2. Helper functions
+# ============================================================
+
+prepare_virus_data <- function(file_path, sheet = "Sheet1") {
+  dat <- read_excel(file_path, sheet = sheet)
+
+  dat <- dat %>%
+    mutate(
+      Cov.id = as.factor(Cov.id),
+      Days_from_onset = as.numeric(Days_from_onset),
+      Culture_positive = as.numeric(Culture_positive),
+      N = as.numeric(N),
+      Culture_negative = N - Culture_positive
+    ) %>%
+    filter(
+      !is.na(Days_from_onset),
+      !is.na(Culture_positive),
+      !is.na(N),
+      N > 0
+    )
+
+  return(dat)
+}
+
+
+prepare_sars_covariates <- function(dat) {
+  if ("Variant" %in% names(dat)) {
+    dat$Variant <- as.factor(dat$Variant)
+
+    if ("Early pandemic strain" %in% levels(dat$Variant)) {
+      dat$Variant <- relevel(dat$Variant, ref = "Early pandemic strain")
+    }
+  }
+
+  if ("Sample_type" %in% names(dat)) {
+    dat$Sample_type <- as.factor(dat$Sample_type)
+
+    if ("Upper respiratory tract" %in% levels(dat$Sample_type)) {
+      dat$Sample_type <- relevel(dat$Sample_type, ref = "Upper respiratory tract")
+    }
+  }
+
+  if ("Vaccination_proportion" %in% names(dat)) {
+    dat$Vaccination_proportion <- as.numeric(dat$Vaccination_proportion)
+  }
+
+  return(dat)
+}
+
+
+aggregate_observed <- function(dat, virus_name) {
+  dat %>%
+    group_by(Days_from_onset) %>%
+    summarise(
+      total_positive = sum(Culture_positive, na.rm = TRUE),
+      total_n = sum(N, na.rm = TRUE),
+      prop_positive = total_positive / total_n,
+      .groups = "drop"
+    ) %>%
+    mutate(Virus = virus_name)
+}
+
+
+fit_linear_models <- function(dat) {
+  model_ri <- glmer(
+    cbind(Culture_positive, Culture_negative) ~
+      Days_from_onset + (1 | Cov.id),
+    data = dat,
+    family = binomial,
+    control = glmerControl(optimizer = "bobyqa")
+  )
+
+  model_rs <- glmer(
+    cbind(Culture_positive, Culture_negative) ~
+      Days_from_onset + (Days_from_onset | Cov.id),
+    data = dat,
+    family = binomial,
+    control = glmerControl(optimizer = "bobyqa")
+  )
+
+  list(
+    RI = model_ri,
+    RS = model_rs,
+    AIC = AIC(model_ri, model_rs),
+    LRT = anova(model_ri, model_rs)
+  )
+}
+
+
+predict_fixed_curve <- function(model, dat, virus_name, max_day = 30) {
+  pred_df <- data.frame(
+    Days_from_onset = seq(
+      min(dat$Days_from_onset, na.rm = TRUE),
+      max_day,
+      by = 0.1
+    )
+  )
+
+  pred_logit <- predict(
+    model,
+    newdata = pred_df,
+    type = "link",
+    re.form = NA,
+    se.fit = TRUE
+  )
+
+  pred_df %>%
+    mutate(
+      pred = plogis(pred_logit$fit),
+      lower = plogis(pred_logit$fit - 1.96 * pred_logit$se.fit),
+      upper = plogis(pred_logit$fit + 1.96 * pred_logit$se.fit),
+      Virus = virus_name
+    )
+}
+
+
+get_time_to_threshold <- function(pred_df, pred_col = "pred", threshold = 0.05) {
+  temp <- pred_df %>%
+    filter(.data[[pred_col]] < threshold)
+
+  if (nrow(temp) == 0) {
+    return(NA_real_)
+  } else {
+    return(min(temp$Days_from_onset))
+  }
+}
+
+
+get_threshold_table <- function(pred_df, virus_name) {
+  data.frame(
+    Virus = virus_name,
+    threshold = c("5%", "1%"),
+    estimate_day = c(
+      get_time_to_threshold(pred_df, "pred", 0.05),
+      get_time_to_threshold(pred_df, "pred", 0.01)
+    ),
+    lower_day = c(
+      get_time_to_threshold(pred_df, "lower", 0.05),
+      get_time_to_threshold(pred_df, "lower", 0.01)
+    ),
+    upper_day = c(
+      get_time_to_threshold(pred_df, "upper", 0.05),
+      get_time_to_threshold(pred_df, "upper", 0.01)
+    )
+  )
+}
+
+
+# ============================================================
+# 3. SARS-CoV-2 analysis
+# ============================================================
+
+sars_data <- prepare_virus_data(sars_file, sheet = "Sheet1")
+sars_data <- prepare_sars_covariates(sars_data)
+
+agg_sars <- aggregate_observed(sars_data, "SARS-CoV-2")
+
+sars_models <- fit_linear_models(sars_data)
+
+# Model comparison: random intercept vs random intercept + slope
+print(sars_models$AIC)
+print(sars_models$LRT)
+
+# Final SARS-CoV-2 model: linear random intercept + random slope
+Model_sars <- sars_models$RS
+summary(Model_sars)
+
+pred_sars <- predict_fixed_curve(
+  model = Model_sars,
+  dat = sars_data,
+  virus_name = "SARS-CoV-2",
+  max_day = 30
+)
+
+threshold_sars <- get_threshold_table(pred_sars, "SARS-CoV-2")
+print(threshold_sars)
+
+
+# ============================================================
+# 4. Exploratory SARS-CoV-2 covariate analyses
+# ============================================================
+
+# Base model for comparison
+Model_base <- Model_sars
+
+# 4A. Vaccination proportion
+Model_vac <- glmer(
+  cbind(Culture_positive, Culture_negative) ~
+    Days_from_onset +
+    Vaccination_proportion +
+    (Days_from_onset | Cov.id),
+  data = sars_data,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+Model_vac_interaction <- glmer(
+  cbind(Culture_positive, Culture_negative) ~
+    Days_from_onset * Vaccination_proportion +
+    (Days_from_onset | Cov.id),
+  data = sars_data,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+summary(Model_vac)
+anova(Model_vac, Model_vac_interaction)
+
+
+# 4B. Variant
+Model_variant <- glmer(
+  cbind(Culture_positive, Culture_negative) ~
+    Days_from_onset +
+    Variant +
+    (Days_from_onset | Cov.id),
+  data = sars_data,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+Model_variant_interaction <- glmer(
+  cbind(Culture_positive, Culture_negative) ~
+    Days_from_onset * Variant +
+    (Days_from_onset | Cov.id),
+  data = sars_data,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+summary(Model_variant)
+anova(Model_variant, Model_variant_interaction)
+
+
+# 4C. Sample type
+Model_sampletype <- glmer(
+  cbind(Culture_positive, Culture_negative) ~
+    Days_from_onset +
+    Sample_type +
+    (Days_from_onset | Cov.id),
+  data = sars_data,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+Model_sampletype_interaction <- glmer(
+  cbind(Culture_positive, Culture_negative) ~
+    Days_from_onset * Sample_type +
+    (Days_from_onset | Cov.id),
+  data = sars_data,
+  family = binomial,
+  control = glmerControl(
+    optimizer = "bobyqa",
+    optCtrl = list(maxfun = 2e5)
+  )
+)
+
+summary(Model_sampletype)
+anova(Model_sampletype, Model_sampletype_interaction)
+
+
+# 4D. Multivariable model
+Model_multivariable <- glmer(
+  cbind(Culture_positive, Culture_negative) ~
+    Days_from_onset +
+    Vaccination_proportion +
+    Sample_type +
+    (Days_from_onset | Cov.id),
+  data = sars_data,
+  family = binomial,
+  control = glmerControl(optimizer = "bobyqa")
+)
+
+summary(Model_multivariable)
+exp(fixef(Model_multivariable))
+
+
+# 4E. Model comparison table for SARS-CoV-2 covariates
+sars_covariate_model_comparison <- data.frame(
+  Analysis = c(
+    "Model comparison",
+    "Model comparison",
+    "Model comparison",
+    "Model comparison",
+    "Model comparison",
+    "Interaction",
+    "Interaction",
+    "Interaction"
+  ),
+  Model = c(
+    "Base model (Linear RS)",
+    "+ Vaccination proportion",
+    "+ Variant",
+    "+ Sample type",
+    "Multivariable model",
+    "Vaccination proportion x Time",
+    "Variant x Time",
+    "Sample type x Time"
+  ),
+  Statistic = c(
+    paste0("AIC = ", round(AIC(Model_base), 1)),
+    paste0("AIC = ", round(AIC(Model_vac), 1)),
+    paste0("AIC = ", round(AIC(Model_variant), 1)),
+    paste0("AIC = ", round(AIC(Model_sampletype), 1)),
+    paste0("AIC = ", round(AIC(Model_multivariable), 1)),
+    paste0("p = ", signif(anova(Model_vac, Model_vac_interaction)$`Pr(>Chisq)`[2], 3)),
+    paste0("p = ", signif(anova(Model_variant, Model_variant_interaction)$`Pr(>Chisq)`[2], 3)),
+    paste0("p = ", signif(anova(Model_sampletype, Model_sampletype_interaction)$`Pr(>Chisq)`[2], 3))
+  )
+)
+
+print(sars_covariate_model_comparison)
+
+
+# ============================================================
+# 5. Influenza analysis
+# ============================================================
+
+flu_data <- prepare_virus_data(flu_file, sheet = "Sheet2")
+
+agg_flu <- aggregate_observed(flu_data, "Influenza")
+
+flu_models <- fit_linear_models(flu_data)
+
+# Model comparison: random intercept vs random intercept + slope
+print(flu_models$AIC)
+print(flu_models$LRT)
+
+# Final influenza model: linear random intercept
+Model_flu <- flu_models$RI
+summary(Model_flu)
+
+pred_flu <- predict_fixed_curve(
+  model = Model_flu,
+  dat = flu_data,
+  virus_name = "Influenza",
+  max_day = 30
+)
+
+threshold_flu <- get_threshold_table(pred_flu, "Influenza")
+print(threshold_flu)
+
+
+# ============================================================
+# 6. RSV analysis
+# ============================================================
+
+rsv_data <- prepare_virus_data(rsv_file, sheet = "Sheet2")
+
+agg_rsv <- aggregate_observed(rsv_data, "RSV")
+
+rsv_models <- fit_linear_models(rsv_data)
+
+# Model comparison: random intercept vs random intercept + slope
+print(rsv_models$AIC)
+print(rsv_models$LRT)
+
+# Final RSV model: linear random intercept
+Model_rsv <- rsv_models$RI
+summary(Model_rsv)
+
+pred_rsv <- predict_fixed_curve(
+  model = Model_rsv,
+  dat = rsv_data,
+  virus_name = "RSV",
+  max_day = 30
+)
+
+threshold_rsv <- get_threshold_table(pred_rsv, "RSV")
+print(threshold_rsv)
+
+
+# ============================================================
+# 7. Combine threshold results
+# ============================================================
+
+threshold_results_all <- bind_rows(
+  threshold_sars,
+  threshold_flu,
+  threshold_rsv
+)
+
+print(threshold_results_all)
+
+write.csv(
+  threshold_results_all,
+  file.path(output_dir, "time_to_threshold_results_all_viruses.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  sars_covariate_model_comparison,
+  file.path(output_dir, "sars_covariate_model_comparison.csv"),
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 8. Main figure: virus-specific temporal culturability
+# ============================================================
+
+all_pred <- bind_rows(
+  pred_sars,
+  pred_flu,
+  pred_rsv
+)
+
+all_obs <- bind_rows(
+  agg_sars,
+  agg_flu,
+  agg_rsv
+)
+
+all_pred$Virus <- factor(
+  all_pred$Virus,
+  levels = c("SARS-CoV-2", "Influenza", "RSV"),
+  labels = c("A", "B", "C")
+)
+
+all_obs$Virus <- factor(
+  all_obs$Virus,
+  levels = c("SARS-CoV-2", "Influenza", "RSV"),
+  labels = c("A", "B", "C")
+)
+
+plot_virus <- ggplot() +
+  geom_point(
+    data = all_obs,
+    aes(
+      x = Days_from_onset,
+      y = prop_positive,
+      size = total_n
+    ),
+    color = "grey40",
+    alpha = 0.7
+  ) +
+  geom_ribbon(
+    data = all_pred,
+    aes(
+      x = Days_from_onset,
+      ymin = lower,
+      ymax = upper
+    ),
+    fill = "#800080",
+    alpha = 0.12
+  ) +
+  geom_line(
+    data = all_pred,
+    aes(
+      x = Days_from_onset,
+      y = pred
+    ),
+    color = "#800080",
+    linewidth = 1.2
+  ) +
+  geom_hline(
+    yintercept = 0.05,
+    linetype = "dashed",
+    color = "black",
+    linewidth = 0.7
+  ) +
+  geom_hline(
+    yintercept = 0.01,
+    linetype = "dotted",
+    color = "black",
+    linewidth = 0.7
+  ) +
+  facet_wrap(~ Virus, nrow = 1) +
+  labs(
+    x = "Days from symptom onset",
+    y = "Probability of positive virus culture",
+    size = "Number tested"
+  ) +
+  scale_x_continuous(
+    limits = c(0, 30),
+    breaks = seq(0, 30, 5),
+    expand = expansion(mult = c(0.035, 0.02))
+  ) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.25)
+  ) +
+  scale_size_continuous(range = c(2, 8)) +
+  theme_classic(base_size = 14) +
+  theme(
+    strip.background = element_blank(),
+    strip.text = element_text(face = "bold", size = 14),
+    legend.position = "right",
+    panel.border = element_rect(color = "black", fill = NA, linewidth = 0.6),
+    panel.spacing = unit(1.2, "lines"),
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 11),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+plot_virus
+
+ggsave(
+  filename = file.path(output_dir, "figure_temporal_culturability_all_viruses.png"),
+  plot = plot_virus,
+  width = 11,
+  height = 4.5,
+  dpi = 600
+)
+
+
+# ============================================================
+# 9. Supplementary figure: SARS-CoV-2 by specimen type
+# ============================================================
+
+agg_sample <- sars_data %>%
+  group_by(Days_from_onset, Sample_type) %>%
+  summarise(
+    total_pos = sum(Culture_positive, na.rm = TRUE),
+    total_neg = sum(Culture_negative, na.rm = TRUE),
+    total_n = total_pos + total_neg,
+    prop_positive = total_pos / total_n,
+    .groups = "drop"
+  ) %>%
+  filter(total_n > 0)
+
+pred_sample <- expand.grid(
+  Days_from_onset = seq(
+    min(sars_data$Days_from_onset, na.rm = TRUE),
+    30,
+    by = 0.1
+  ),
+  Sample_type = levels(sars_data$Sample_type),
+  Vaccination_proportion = 0.5
+)
+
+pred_logit_sample <- predict(
+  Model_multivariable,
+  newdata = pred_sample,
+  type = "link",
+  re.form = NA,
+  se.fit = TRUE
+)
+
+pred_sample <- pred_sample %>%
+  mutate(
+    pred = plogis(pred_logit_sample$fit),
+    lower = plogis(pred_logit_sample$fit - 1.96 * pred_logit_sample$se.fit),
+    upper = plogis(pred_logit_sample$fit + 1.96 * pred_logit_sample$se.fit)
+  )
+
+plot_sample <- ggplot() +
+  geom_point(
+    data = agg_sample,
+    aes(
+      x = Days_from_onset,
+      y = prop_positive,
+      color = Sample_type,
+      size = total_n
+    ),
+    alpha = 0.7
+  ) +
+  geom_ribbon(
+    data = pred_sample,
+    aes(
+      x = Days_from_onset,
+      ymin = lower,
+      ymax = upper,
+      fill = Sample_type
+    ),
+    alpha = 0.15,
+    color = NA
+  ) +
+  geom_line(
+    data = pred_sample,
+    aes(
+      x = Days_from_onset,
+      y = pred,
+      color = Sample_type
+    ),
+    linewidth = 1.2
+  ) +
+  geom_hline(
+    yintercept = 0.05,
+    linetype = "dashed",
+    color = "black",
+    linewidth = 0.7
+  ) +
+  geom_hline(
+    yintercept = 0.01,
+    linetype = "dotted",
+    color = "black",
+    linewidth = 0.7
+  ) +
+  labs(
+    x = "Days from symptom onset",
+    y = "Probability of positive virus culture",
+    color = "Specimen type",
+    fill = "Specimen type",
+    size = "Number tested"
+  ) +
+  scale_size_continuous(range = c(2, 8)) +
+  scale_y_continuous(
+    limits = c(0, 1),
+    breaks = seq(0, 1, 0.25)
+  ) +
+  scale_x_continuous(
+    limits = c(0, 30),
+    breaks = seq(0, 30, 5),
+    expand = expansion(mult = c(0.02, 0.02))
+  ) +
+  theme_classic(base_size = 14) +
+  theme(
+    legend.position = "right",
+    axis.title = element_text(size = 14),
+    axis.text = element_text(size = 12),
+    legend.title = element_text(size = 12),
+    legend.text = element_text(size = 11)
+  )
+
+plot_sample
+
+ggsave(
+  filename = file.path(output_dir, "figure_sars_cov_2_specimen_type.png"),
+  plot = plot_sample,
+  width = 8,
+  height = 5,
+  dpi = 600
+)
+
+
+# ============================================================
+# 10. Save prediction datasets
+# ============================================================
+
+write.csv(
+  all_pred,
+  file.path(output_dir, "predicted_culture_probability_all_viruses.csv"),
+  row.names = FALSE
+)
+
+write.csv(
+  pred_sample,
+  file.path(output_dir, "predicted_sars_cov_2_specimen_type.csv"),
+  row.names = FALSE
+)
+
+# ============================================================
+# End of script
+# ============================================================
