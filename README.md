@@ -4,10 +4,10 @@ This repository contains the R code used for the statistical analyses and figure
 
 ### The scripts include:
 
-Data preparation
-Mixed-effects logistic regression modelling
-Model prediction
-Time-to-threshold estimation
-Figure generation
+#Data preparation
+#Mixed-effects logistic regression modelling
+#Model prediction
+#Time-to-threshold estimation
+#Figure generation
 
 The analyses were performed in R
