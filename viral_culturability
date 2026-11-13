@@ -2,25 +2,17 @@
 # ============================================================
 # VIRAL CULTURABILITY ANALYSIS
 # SARS-CoV-2, INFLUENZA, RSV
-#
-# OUTPUTS:
-# Table S5: Temporal model comparison
-# Table S6: SARS-CoV-2 covariate model comparison
-# Figure 2A-C: Original three-virus figure
-# Figure S1A-B: Specimen type and vaccination (0% / 100%)
-# Figure S2A-C: Study-specific predictions, days 0-30
-# Cloglog sensitivity: Numerical results only
-# ============================================================
-
-
-# ============================================================
-# 1. PACKAGES AND FILE PATHS
 # ============================================================
 
 library(readxl)
 library(dplyr)
 library(ggplot2)
 library(lme4)
+
+
+# ============================================================
+# 1. FILE PATHS
+# ============================================================
 
 base_dir <- paste0(
   "C:/Users/USER/Nanyang Technological University/",
@@ -29,29 +21,15 @@ base_dir <- paste0(
 )
 
 sars_file <- file.path(
-  base_dir,
-  "1. SARS-CoV-2",
-  "study_data_template.xlsx"
+  base_dir, "1. SARS-CoV-2", "study_data_template.xlsx"
 )
 
 flu_file <- file.path(
-  base_dir,
-  "2. Influenza",
-  "influenza data - analyse.xlsx"
+  base_dir, "2. Influenza", "influenza data - analyse.xlsx"
 )
 
 rsv_file <- file.path(
-  base_dir,
-  "3. RSV",
-  "study_data_template_rsv.xlsx"
-)
-
-output_dir <- file.path(base_dir, "outputs")
-
-dir.create(
-  output_dir,
-  recursive = TRUE,
-  showWarnings = FALSE
+  base_dir, "3. RSV", "study_data_template_rsv.xlsx"
 )
 
 
@@ -60,7 +38,6 @@ dir.create(
 # ============================================================
 
 read_virus <- function(file, sheet) {
-  
   read_excel(file, sheet = sheet) %>%
     mutate(
       Cov.id = factor(Cov.id),
@@ -77,12 +54,12 @@ read_virus <- function(file, sheet) {
       N > 0,
       Culture_positive >= 0,
       Culture_positive <= N
-    )
+    ) %>%
+    droplevels()
 }
 
 
 fit_model <- function(formula, data, link = "logit") {
-  
   glmer(
     formula,
     data = data,
@@ -95,66 +72,83 @@ fit_model <- function(formula, data, link = "logit") {
 }
 
 
-lrt <- function(simple, complex) {
-  
-  stopifnot(
-    identical(
-      rownames(model.frame(simple)),
-      rownames(model.frame(complex))
-    )
-  )
-  
-  as.numeric(
-    anova(simple, complex)$`Pr(>Chisq)`[2]
+# Fixed-effect estimates with Wald 95% CI
+extract_fixed <- function(model, name) {
+  coefs <- summary(model)$coefficients
+  ci <- confint(model, parm = "beta_", method = "Wald")
+
+  data.frame(
+    Model = name,
+    Parameter = rownames(coefs),
+    Estimate = round(coefs[, "Estimate"], 3),
+    Lower_95CI = round(ci[rownames(coefs), 1], 3),
+    Upper_95CI = round(ci[rownames(coefs), 2], 3),
+    P_value = signif(coefs[, "Pr(>|z|)"], 3),
+    row.names = NULL
   )
 }
 
 
-format_p <- function(p) {
-  
-  if (is.na(p)) return("—")
-  
-  if (p < 0.001) return("<0.001")
-  
-  sprintf("%.4f", p)
+# Random-effect SD and correlation
+extract_random <- function(model, name) {
+  re <- as.data.frame(VarCorr(model))
+
+  data.frame(
+    Model = name,
+    Parameter = ifelse(
+      is.na(re$var2),
+      paste0(re$var1, " SD"),
+      paste(re$var1, re$var2, "Correlation", sep = " / ")
+    ),
+    Value = round(re$sdcor, 3),
+    row.names = NULL
+  )
 }
 
 
-# Fixed-effect prediction with approximate 95% CI
-
+# Fixed-effect predictions with approximate 95% CI
 predict_curve <- function(model, newdata) {
-  
   fixed_formula <- lme4::nobars(formula(model))
-  
+
   X <- model.matrix(
     delete.response(terms(fixed_formula)),
     data = newdata
   )
-  
+
   beta <- fixef(model)
   V <- as.matrix(vcov(model))
-  
+
   X <- X[, names(beta), drop = FALSE]
   V <- V[names(beta), names(beta), drop = FALSE]
-  
+
   eta <- as.vector(X %*% beta)
-  
-  se <- sqrt(
-    pmax(0, rowSums((X %*% V) * X))
-  )
-  
+  se <- sqrt(pmax(0, rowSums((X %*% V) * X)))
+
   linkinv <- family(model)$linkinv
-  
+
   newdata$pred <- linkinv(eta)
   newdata$lower <- linkinv(eta - 1.96 * se)
   newdata$upper <- linkinv(eta + 1.96 * se)
-  
+
   newdata
 }
 
 
+make_pred <- function(model, data, virus, end_day = 30) {
+  newdata <- data.frame(
+    Days_from_onset = seq(
+      min(data$Days_from_onset),
+      end_day,
+      by = 0.1
+    )
+  )
+
+  predict_curve(model, newdata) %>%
+    mutate(Virus = virus)
+}
+
+
 aggregate_obs <- function(data, virus) {
-  
   data %>%
     group_by(Days_from_onset) %>%
     summarise(
@@ -167,68 +161,40 @@ aggregate_obs <- function(data, virus) {
 }
 
 
-make_pred <- function(model, data, virus, end_day = 30) {
-  
-  newdata <- data.frame(
-    Days_from_onset = seq(
-      min(data$Days_from_onset),
-      end_day,
-      by = 0.1
-    )
-  )
-  
-  predict_curve(model, newdata) %>%
-    mutate(Virus = virus)
-}
-
-
+# Time at which prediction crosses threshold
 crossing_day <- function(pred, column, threshold) {
-  
   pred <- pred[order(pred$Days_from_onset), ]
-  
+
   x <- pred$Days_from_onset
   y <- pred[[column]]
-  
-  if (length(x) == 0 || anyNA(y)) {
-    return(NA_real_)
-  }
-  
+
+  if (length(x) == 0 || anyNA(y)) return(NA_real_)
   if (y[1] <= threshold) return(x[1])
-  
+
   idx <- which(
     head(y, -1) > threshold &
       tail(y, -1) <= threshold
   )
-  
+
   if (length(idx) == 0) return(NA_real_)
-  
+
   i <- idx[1]
-  
+
   x[i] + (threshold - y[i]) *
-    (x[i + 1] - x[i]) /
-    (y[i + 1] - y[i])
+    (x[i + 1] - x[i]) / (y[i + 1] - y[i])
 }
 
 
-threshold_table <- function(pred, virus) {
-  
-  bind_rows(
-    lapply(c(0.05, 0.01), function(t) {
-      
-      data.frame(
-        Virus = virus,
-        Threshold = paste0(t * 100, "%"),
-        Estimate_day = crossing_day(pred, "pred", t),
-        Lower_band_crossing = crossing_day(
-          pred, "lower", t
-        ),
-        Upper_band_crossing = crossing_day(
-          pred, "upper", t
-        )
-      )
-      
-    })
-  )
+threshold_table <- function(pred, group) {
+  bind_rows(lapply(c(0.05, 0.01), function(t) {
+    data.frame(
+      Group = group,
+      Threshold = paste0(t * 100, "%"),
+      Estimate_day = crossing_day(pred, "pred", t),
+      Lower_band_crossing = crossing_day(pred, "lower", t),
+      Upper_band_crossing = crossing_day(pred, "upper", t)
+    )
+  }))
 }
 
 
@@ -237,55 +203,34 @@ threshold_table <- function(pred, virus) {
 # ============================================================
 
 sars <- read_virus(
-  sars_file,
-  "Sheet1 (Final data wo 23&24)"
+  sars_file, "Sheet1 (Final data wo 23&24)"
 )
 
-flu <- read_virus(
-  flu_file,
-  "Sheet2"
-)
-
-rsv <- read_virus(
-  rsv_file,
-  "Sheet2"
-)
+flu <- read_virus(flu_file, "Sheet2")
+rsv <- read_virus(rsv_file, "Sheet2")
 
 
 sars <- sars %>%
   mutate(
-    Vaccination_proportion =
-      as.numeric(Vaccination_proportion),
+    Vaccination_proportion = as.numeric(Vaccination_proportion),
     Variant = factor(Variant),
     Sample_type = factor(Sample_type)
   )
 
 
-if ("Early pandemic strain" %in% levels(sars$Variant)) {
-  
-  sars$Variant <- relevel(
-    sars$Variant,
-    ref = "Early pandemic strain"
-  )
-  
-}
+# Reference categories
+sars$Variant <- relevel(
+  sars$Variant,
+  ref = "Early pandemic strain"
+)
+
+sars$Sample_type <- relevel(
+  sars$Sample_type,
+  ref = "Upper respiratory tract"
+)
 
 
-if ("Upper respiratory tract" %in%
-    levels(sars$Sample_type)) {
-  
-  sars$Sample_type <- relevel(
-    sars$Sample_type,
-    ref = "Upper respiratory tract"
-  )
-  
-} else {
-  
-  stop("Upper respiratory tract is missing from Sample_type")
-  
-}
-
-
+# Same dataset for all interaction models
 sars_cov <- sars %>%
   filter(
     !is.na(Vaccination_proportion),
@@ -294,45 +239,29 @@ sars_cov <- sars %>%
   ) %>%
   droplevels()
 
-
 stopifnot(
   all(sars_cov$Vaccination_proportion >= 0),
   all(sars_cov$Vaccination_proportion <= 1)
 )
 
 
-cat(
-  "\nSARS-CoV-2 observations:",
-  nrow(sars_cov),
-  "\nStudies:",
-  n_distinct(sars_cov$Cov.id),
-  "\n"
-)
-
-
 # ============================================================
-# 4. TEMPORAL MODELS
+# 4. PRIMARY TEMPORAL MODELS
 # ============================================================
 
 fit_temporal <- function(data) {
-  
-  RI <- fit_model(
-    cbind(Culture_positive, Culture_negative) ~
-      Days_from_onset +
-      (1 | Cov.id),
-    data
-  )
-  
-  RS <- fit_model(
-    cbind(Culture_positive, Culture_negative) ~
-      Days_from_onset +
-      (Days_from_onset | Cov.id),
-    data
-  )
-  
   list(
-    RI = RI,
-    RS = RS
+    RI = fit_model(
+      cbind(Culture_positive, Culture_negative) ~
+        Days_from_onset + (1 | Cov.id),
+      data
+    ),
+
+    RS = fit_model(
+      cbind(Culture_positive, Culture_negative) ~
+        Days_from_onset + (Days_from_onset | Cov.id),
+      data
+    )
   )
 }
 
@@ -343,476 +272,181 @@ rsv_fit <- fit_temporal(rsv)
 
 
 # Selected models
-
 Model_sars <- sars_fit$RS
 Model_flu <- flu_fit$RI
 Model_rsv <- rsv_fit$RI
 
 
-# ============================================================
-# 5. SUPPLEMENTARY TABLE S5
-# ============================================================
-
+# Temporal model comparison
 Table_S5 <- data.frame(
-  
-  Virus = rep(
-    c("SARS-CoV-2", "Influenza", "RSV"),
-    each = 2
-  ),
-  
-  Model = rep(
-    c("Linear RI", "Linear RS"),
-    3
-  ),
-  
-  Random_effect_structure = rep(
-    c(
-      "Random intercept",
-      "Random intercept + slope"
-    ),
-    3
-  ),
-  
-  Time_function = "Linear",
-  
-  AIC = round(
-    c(
-      AIC(sars_fit$RI),
-      AIC(sars_fit$RS),
-      AIC(flu_fit$RI),
-      AIC(flu_fit$RS),
-      AIC(rsv_fit$RI),
-      AIC(rsv_fit$RS)
-    ),
-    1
-  ),
-  
-  LRT_p_value = c(
-    "—",
-    format_p(lrt(sars_fit$RI, sars_fit$RS)),
-    "—",
-    format_p(lrt(flu_fit$RI, flu_fit$RS)),
-    "—",
-    format_p(lrt(rsv_fit$RI, rsv_fit$RS))
-  ),
-  
-  Selected = c(
-    "No", "Yes",
-    "Yes", "No",
-    "Yes", "No"
+  Virus = rep(c("SARS-CoV-2", "Influenza", "RSV"), each = 2),
+  Model = rep(c("RI", "RS"), 3),
+  AIC = c(
+    AIC(sars_fit$RI), AIC(sars_fit$RS),
+    AIC(flu_fit$RI), AIC(flu_fit$RS),
+    AIC(rsv_fit$RI), AIC(rsv_fit$RS)
   )
-  
 )
 
+print(Table_S5)
 
-print(Table_S5, row.names = FALSE)
 
-write.csv(
-  Table_S5,
-  file.path(output_dir, "Table_S5.csv"),
-  row.names = FALSE
+# Primary fixed and random effects
+primary_models <- list(
+  "SARS-CoV-2" = Model_sars,
+  "Influenza" = Model_flu,
+  "RSV" = Model_rsv
 )
+
+Primary_fixed <- bind_rows(
+  Map(extract_fixed, primary_models, names(primary_models))
+)
+
+Primary_random <- bind_rows(
+  Map(extract_random, primary_models, names(primary_models))
+)
+
+print(Primary_fixed)
+print(Primary_random)
 
 
 # ============================================================
-# 6. SARS-CoV-2 COVARIATE MODELS
+# 5. SARS-CoV-2 INTERACTION MODELS: I2-I9
 # ============================================================
 
 response <- "cbind(Culture_positive, Culture_negative)"
-
 random_part <- "(Days_from_onset | Cov.id)"
 
 f <- function(rhs) {
-  
   as.formula(
     paste(response, "~", rhs, "+", random_part)
   )
-  
 }
 
 
-# Individual covariate models
+interaction_terms <- c(
+  I2 = "Days_from_onset",
 
-Model_base <- fit_model(
-  f("Days_from_onset"),
-  sars_cov
-)
+  I3 = "Days_from_onset * Vaccination_proportion",
 
-Model_vac <- fit_model(
-  f("Days_from_onset + Vaccination_proportion"),
-  sars_cov
-)
+  I4 = "Days_from_onset * Variant",
 
-Model_variant <- fit_model(
-  f("Days_from_onset + Variant"),
-  sars_cov
-)
+  I5 = "Days_from_onset * Sample_type",
 
-Model_sample <- fit_model(
-  f("Days_from_onset + Sample_type"),
-  sars_cov
-)
-
-
-# Individual interaction models
-
-Model_vac_int <- fit_model(
-  f("Days_from_onset * Vaccination_proportion"),
-  sars_cov
-)
-
-Model_variant_int <- fit_model(
-  f("Days_from_onset * Variant"),
-  sars_cov
-)
-
-Model_sample_int <- fit_model(
-  f("Days_from_onset * Sample_type"),
-  sars_cov
-)
-
-
-# Multivariable models
-
-Model_full <- fit_model(
-  f(
-    "Days_from_onset + Vaccination_proportion + Variant + Sample_type"
+  I6 = paste(
+    "Days_from_onset * Vaccination_proportion",
+    "+ Days_from_onset * Variant"
   ),
-  sars_cov
-)
 
-Model_reduced <- fit_model(
-  f(
-    "Days_from_onset + Vaccination_proportion + Sample_type"
+  I7 = paste(
+    "Days_from_onset * Vaccination_proportion",
+    "+ Days_from_onset * Sample_type"
   ),
-  sars_cov
-)
 
-Model_vacint_spec <- fit_model(
-  f(
-    "Days_from_onset * Vaccination_proportion + Sample_type"
+  I8 = paste(
+    "Days_from_onset * Variant",
+    "+ Days_from_onset * Sample_type"
   ),
-  sars_cov
-)
 
-Model_both_int <- fit_model(
-  f(
-    "Days_from_onset * Vaccination_proportion + Days_from_onset * Sample_type"
-  ),
-  sars_cov
-)
-
-
-
-# ============================================================
-# 7. SUPPLEMENTARY TABLE S6
-# SARS-CoV-2 covariate and interaction model comparisons
-#
-# INDIVIDUAL COVARIATE MODELS
-# M2 = Time only
-# M7 = Time + vaccination
-# M8 = Time + variant
-# M9 = Time + specimen type
-#
-# INDIVIDUAL INTERACTION MODELS
-# M10 = Time x vaccination
-# M11 = Time x variant
-# M12 = Time x specimen type
-#
-# MULTIVARIABLE MODELS
-# M13 = Full main effects
-# M14 = Reduced main effects (FINAL MODEL)
-# M16 = Reduced model + both time interactions
-#
-# LRT comparisons:
-# M7  vs M2
-# M8  vs M2
-# M9  vs M2
-# M10 vs M7
-# M11 vs M8
-# M12 vs M9
-# M13 vs M14 (variant contribution)
-# M16 vs M14 (joint interaction test)
-# ============================================================
-
-
-# ------------------------------------------------------------
-# 7.1 Models included in Supplementary Table S6
-# ------------------------------------------------------------
-
-models_S6 <- list(
-  Model_base,
-  Model_vac,
-  Model_variant,
-  Model_sample,
-  Model_vac_int,
-  Model_variant_int,
-  Model_sample_int,
-  Model_full,
-  Model_reduced,
-  Model_both_int
+  I9 = paste(
+    "Days_from_onset * Vaccination_proportion",
+    "+ Days_from_onset * Variant",
+    "+ Days_from_onset * Sample_type"
+  )
 )
 
 
-# ------------------------------------------------------------
-# 7.2 Likelihood-ratio tests
-# ------------------------------------------------------------
-
-p_S6 <- c(
-  NA_real_,
-  
-  # Individual covariates vs time-only baseline
-  lrt(Model_base, Model_vac),
-  lrt(Model_base, Model_variant),
-  lrt(Model_base, Model_sample),
-  
-  # Individual interactions vs corresponding main effects
-  lrt(Model_vac, Model_vac_int),
-  lrt(Model_variant, Model_variant_int),
-  lrt(Model_sample, Model_sample_int),
-  
-  # Full multivariable model (reference row)
-  NA_real_,
-  
-  # M14 vs M13: Does variant improve model fit?
-  lrt(Model_reduced, Model_full),
-  
-  # M14 vs M16: Do both interactions jointly improve fit?
-  lrt(Model_reduced, Model_both_int)
+interaction_models <- lapply(
+  interaction_terms,
+  function(rhs) fit_model(f(rhs), sars_cov)
 )
 
 
-# ------------------------------------------------------------
-# 7.3 Create Supplementary Table S6
-# ------------------------------------------------------------
-
+# AIC comparison
 Table_S6 <- data.frame(
-  
-  Analysis = c(
-    rep("Individual covariate models", 4),
-    rep("Individual time-interaction models", 3),
-    rep("Multivariable models", 3)
-  ),
-  
-  Model_ID = c(
-    "M2",
-    "M7",
-    "M8",
-    "M9",
-    "M10",
-    "M11",
-    "M12",
-    "M13",
-    "M14",
-    "M16"
-  ),
-  
-  Model = c(
-    "Baseline",
-    "Vaccination",
-    "Variant",
-    "Specimen type",
-    
-    "Vaccination interaction",
-    "Variant interaction",
-    "Specimen-type interaction",
-    
-    "Full main effects",
-    "Reduced main effects",
-    "Both time interactions"
-  ),
-  
-  Description = c(
-    "Time only",
-    "Time + vaccination proportion",
-    "Time + variant",
-    "Time + specimen type",
-    
-    "Time x vaccination proportion",
-    "Time x variant",
-    "Time x specimen type",
-    
-    "Time + vaccination + variant + specimen type",
-    "Time + vaccination + specimen type",
-    "Time x vaccination + time x specimen type"
-  ),
-  
-  AIC = round(
-    vapply(models_S6, AIC, numeric(1)),
-    1
-  ),
-  
-  LRT_comparison = c(
-    "—",
-    "M2 vs M7",
-    "M2 vs M8",
-    "M2 vs M9",
-    
-    "M7 vs M10",
-    "M8 vs M11",
-    "M9 vs M12",
-    
-    "—",
-    "M14 vs M13",
-    "M14 vs M16"
-  ),
-  
-  LRT_p_value = vapply(
-    p_S6,
-    format_p,
-    character(1)
-  ),
-  
-  Singular_fit = vapply(
-    models_S6,
-    isSingular,
-    logical(1)
-  ),
-  
-  stringsAsFactors = FALSE
-)
-
-
-# ------------------------------------------------------------
-# 7.4 Display Table S6
-# ------------------------------------------------------------
-
-cat("\n========================================\n")
-cat("SUPPLEMENTARY TABLE S6\n")
-cat("========================================\n")
-
-print(
-  Table_S6,
-  row.names = FALSE
-)
-
-
-# ------------------------------------------------------------
-# 7.5 Export Table S6
-# ------------------------------------------------------------
-
-write.csv(
-  Table_S6,
-  file.path(
-    output_dir,
-    "Table_S6.csv"
-  ),
-  row.names = FALSE,
-  fileEncoding = "UTF-8"
-)
-
-
-# ------------------------------------------------------------
-# 7.6 Display multivariable model comparisons
-# ------------------------------------------------------------
-
-cat("\n========================================\n")
-cat("MULTIVARIABLE MODEL COMPARISONS\n")
-cat("========================================\n")
-
-
-# M14 vs M13: Contribution of variant
-
-cat("\nM14 vs M13: Variant contribution\n")
-
-print(
-  anova(
-    Model_reduced,
-    Model_full
+  Model = names(interaction_models),
+  AIC = vapply(interaction_models, AIC, numeric(1)),
+  BIC = vapply(interaction_models, BIC, numeric(1)),
+  Singular = vapply(
+    interaction_models, isSingular, logical(1)
   )
 )
 
+Table_S6$Delta_AIC <- Table_S6$AIC - min(Table_S6$AIC)
 
-# M14 vs M16: Joint contribution of both interactions
+print(Table_S6[order(Table_S6$AIC), ])
 
-cat("\nM14 vs M16: Joint interaction test\n")
 
-print(
-  anova(
-    Model_reduced,
-    Model_both_int
+# All interaction model estimates
+Interaction_fixed <- bind_rows(
+  Map(
+    extract_fixed,
+    interaction_models,
+    names(interaction_models)
   )
 )
 
-
-# ------------------------------------------------------------
-# 7.7 Final adjusted model
-# ------------------------------------------------------------
-
-Model_final <- Model_reduced
-
-cat("\n========================================\n")
-cat("FINAL ADJUSTED MODEL: M14\n")
-cat("========================================\n")
-
-print(
-  summary(Model_final)
+Interaction_random <- bind_rows(
+  Map(
+    extract_random,
+    interaction_models,
+    names(interaction_models)
+  )
 )
 
-cat("\nFinal model AIC:\n")
-print(AIC(Model_final))
+print(Interaction_fixed)
+print(Interaction_random)
 
+
+# Selected full interaction model
+Model_I9 <- interaction_models$I9
+
+cat("\nI9 MODEL SUMMARY\n")
+print(summary(Model_I9))
+
+cat("\nI9 SINGULAR FIT\n")
+print(isSingular(Model_I9))
+
+cat("\nI9 CONVERGENCE MESSAGES\n")
+print(Model_I9@optinfo$conv$lme4$messages)
 
 
 # ============================================================
-# 8. PRIMARY VIRUS PREDICTIONS
+# 6. FIGURE 2: THREE-VIRUS CULTURABILITY
 # ============================================================
 
-pred_sars <- make_pred(
-  Model_sars, sars, "SARS-CoV-2"
-)
-
-pred_flu <- make_pred(
-  Model_flu, flu, "Influenza"
-)
-
-pred_rsv <- make_pred(
-  Model_rsv, rsv, "RSV"
-)
-
+virus_levels <- c("SARS-CoV-2", "Influenza", "RSV")
 
 all_pred <- bind_rows(
-  pred_sars,
-  pred_flu,
-  pred_rsv
-)
+  make_pred(Model_sars, sars, "SARS-CoV-2"),
+  make_pred(Model_flu, flu, "Influenza"),
+  make_pred(Model_rsv, rsv, "RSV")
+) %>%
+  mutate(
+    Panel = factor(
+      Virus,
+      levels = virus_levels,
+      labels = c("A", "B", "C")
+    )
+  )
 
 
 all_obs <- bind_rows(
   aggregate_obs(sars, "SARS-CoV-2"),
   aggregate_obs(flu, "Influenza"),
   aggregate_obs(rsv, "RSV")
-)
+) %>%
+  mutate(
+    Panel = factor(
+      Virus,
+      levels = virus_levels,
+      labels = c("A", "B", "C")
+    )
+  )
 
-
-virus_levels <- c(
-  "SARS-CoV-2",
-  "Influenza",
-  "RSV"
-)
-
-
-all_pred$Panel <- factor(
-  all_pred$Virus,
-  levels = virus_levels,
-  labels = c("A", "B", "C")
-)
-
-
-all_obs$Panel <- factor(
-  all_obs$Virus,
-  levels = virus_levels,
-  labels = c("A", "B", "C")
-)
-
-
-# ============================================================
-# 9. FIGURE 2A-C
-# ORIGINAL FIGURE, WITH PANEL LABELS LEFT-ALIGNED
-# ============================================================
 
 plot_virus <- ggplot() +
-  
+
   geom_point(
     data = all_obs,
     aes(
@@ -823,7 +457,7 @@ plot_virus <- ggplot() +
     color = "grey40",
     alpha = 0.7
   ) +
-  
+
   geom_ribbon(
     data = all_pred,
     aes(
@@ -834,236 +468,109 @@ plot_virus <- ggplot() +
     fill = "#800080",
     alpha = 0.12
   ) +
-  
+
   geom_line(
     data = all_pred,
-    aes(
-      x = Days_from_onset,
-      y = pred
-    ),
+    aes(Days_from_onset, pred),
     color = "#800080",
     linewidth = 1.2
   ) +
-  
-  geom_hline(
-    yintercept = 0.05,
-    linetype = "dashed"
-  ) +
-  
-  geom_hline(
-    yintercept = 0.01,
-    linetype = "dotted"
-  ) +
-  
-  facet_wrap(
-    ~ Panel,
-    nrow = 1
-  ) +
-  
-  scale_x_continuous(
-    limits = c(0, 30),
-    breaks = seq(0, 30, 5)
-  ) +
-  
-  scale_y_continuous(
-    limits = c(0, 1),
-    breaks = seq(0, 1, 0.25)
-  ) +
-  
-  scale_size_continuous(
-    range = c(2, 8)
-  ) +
-  
+
+  geom_hline(yintercept = 0.05, linetype = "dashed") +
+  geom_hline(yintercept = 0.01, linetype = "dotted") +
+
+  facet_wrap(~Panel, nrow = 1) +
+
+  scale_x_continuous(breaks = seq(0, 30, 5)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.25)) +
+  scale_size_continuous(range = c(2, 8)) +
+
+  coord_cartesian(xlim = c(0, 30), ylim = c(0, 1)) +
+
   labs(
     x = "Days from symptom onset",
     y = "Probability of positive virus culture",
     size = "Number tested"
   ) +
-  
+
   theme_classic(base_size = 14) +
-  
+
   theme(
     strip.background = element_blank(),
-    
-    # UPDATED: A, B, C at top-left
-    strip.text.x = element_text(
-      face = "bold",
-      hjust = 0
-    ),
-    
-    panel.border = element_rect(
-      color = "black",
-      fill = NA
-    ),
-    
+    strip.text.x = element_text(face = "bold", hjust = 0),
+    panel.border = element_rect(color = "black", fill = NA),
     panel.spacing = grid::unit(1.2, "lines")
   )
-
 
 print(plot_virus)
 
 
-ggsave(
-  file.path(
-    output_dir,
-    "figure_all_viruses.png"
-  ),
-  plot = plot_virus,
-  width = 11,
-  height = 4.5,
-  dpi = 600
-)
-
-ggsave(
-  filename = file.path(output_dir, "figure_all_viruses.pdf"),
-  plot = plot_virus,
-  device = cairo_pdf,
-  width = 11,
-  height = 4.5,
-  units = "in"
-)
-
-
 # ============================================================
-# 10. THRESHOLD RESULTS
+# 7. TIME TO 5% AND 1% CULTURE POSITIVITY
 # ============================================================
-
-# Calculate thresholds to day 60.
-# Figure 2 remains unchanged at day 0-30.
 
 threshold_results <- bind_rows(
-  
   threshold_table(
     make_pred(Model_sars, sars, "SARS-CoV-2", 60),
     "SARS-CoV-2"
   ),
-  
   threshold_table(
     make_pred(Model_flu, flu, "Influenza", 60),
     "Influenza"
   ),
-  
   threshold_table(
     make_pred(Model_rsv, rsv, "RSV", 60),
     "RSV"
   )
-  
 )
-
 
 print(threshold_results)
 
 
-write.csv(
-  threshold_results,
-  file.path(
-    output_dir,
-    "time_to_threshold_results.csv"
-  ),
-  row.names = FALSE
-)
-
-
 # ============================================================
-# 11. SUPPLEMENTARY FIGURE S1
-# SPECIMEN TYPE + VACCINATION
-#
-# Both panels use:
-# Time + vaccination proportion + specimen type
-#
-# UPDATED:
-# - Panel labels A and B only
-# - Labels aligned top-left
-# - Narrower figure
-# - All legends on right
-# - Observed dots retained
+# 8. FIGURE 3: VARIANT AND SPECIMEN TYPE
+# Using I9 full interaction model
 # ============================================================
 
-Model_final <- Model_reduced
+Model_final <- Model_I9
+
+days_grid <- seq(0, 30, by = 0.1)
+
+variant_levels <- levels(sars_cov$Variant)
+sample_levels <- levels(sars_cov$Sample_type)
+
+# Vaccination held at 0%
+vaccination_fixed <- 0
 
 
 # ------------------------------------------------------------
-# PANEL A: SPECIMEN TYPE
-# Vaccination fixed at 50%
+# PANEL A: VIRAL VARIANT
+# Specimen fixed at upper respiratory tract
 # ------------------------------------------------------------
 
-new_sample <- expand.grid(
-  Days_from_onset = seq(0, 30, by = 0.1),
-  Sample_type = levels(sars_cov$Sample_type),
-  Vaccination_proportion = 0.5
-)
-
-
-new_sample$Sample_type <- factor(
-  new_sample$Sample_type,
-  levels = levels(sars_cov$Sample_type)
-)
-
-
-pred_sample <- predict_curve(
-  Model_final,
-  new_sample
-)
-
-
-# Observed dots for specimen type
-
-obs_sample <- sars_cov %>%
-  filter(
-    Days_from_onset >= 0,
-    Days_from_onset <= 30
-  ) %>%
-  group_by(
-    Days_from_onset,
-    Sample_type
-  ) %>%
-  summarise(
-    Total_positive = sum(Culture_positive),
-    Total_N = sum(N),
-    Proportion = Total_positive / Total_N,
-    .groups = "drop"
-  )
-
-
-# ------------------------------------------------------------
-# PANEL B: VACCINATION
-# 0% versus 100%
-# Specimen type fixed at upper respiratory tract
-# ------------------------------------------------------------
-
-new_vac <- expand.grid(
-  Days_from_onset = seq(0, 30, by = 0.1),
-  Vaccination_proportion = c(0, 1),
+new_variant <- expand.grid(
+  Days_from_onset = days_grid,
+  Variant = variant_levels,
+  Vaccination_proportion = vaccination_fixed,
   Sample_type = "Upper respiratory tract"
 )
 
-
-new_vac$Sample_type <- factor(
-  new_vac$Sample_type,
-  levels = levels(sars_cov$Sample_type)
+new_variant$Variant <- factor(
+  new_variant$Variant,
+  levels = variant_levels
 )
 
-
-pred_vac <- predict_curve(
-  Model_final,
-  new_vac
+new_variant$Sample_type <- factor(
+  new_variant$Sample_type,
+  levels = sample_levels
 )
 
+pred_variant <- predict_curve(Model_final, new_variant)
 
-# Observed dots only for exactly 0% and 100%.
-# Intermediate vaccination proportions are not reassigned.
 
-obs_vac <- sars_cov %>%
-  filter(
-    Days_from_onset >= 0,
-    Days_from_onset <= 30,
-    Sample_type == "Upper respiratory tract",
-    Vaccination_proportion %in% c(0, 1)
-  ) %>%
-  group_by(
-    Days_from_onset,
-    Vaccination_proportion
-  ) %>%
+obs_variant <- sars_cov %>%
+  filter(between(Days_from_onset, 0, 30)) %>%
+  group_by(Days_from_onset, Variant) %>%
   summarise(
     Total_positive = sum(Culture_positive),
     Total_N = sum(N),
@@ -1073,90 +580,109 @@ obs_vac <- sars_cov %>%
 
 
 # ------------------------------------------------------------
-# COMBINE PREDICTIONS
+# PANEL B: SPECIMEN TYPE
+# Variant fixed at early pandemic
+# ------------------------------------------------------------
+
+new_sample <- expand.grid(
+  Days_from_onset = days_grid,
+  Sample_type = sample_levels,
+  Vaccination_proportion = vaccination_fixed,
+  Variant = "Early pandemic strain"
+)
+
+new_sample$Sample_type <- factor(
+  new_sample$Sample_type,
+  levels = sample_levels
+)
+
+new_sample$Variant <- factor(
+  new_sample$Variant,
+  levels = variant_levels
+)
+
+pred_sample <- predict_curve(Model_final, new_sample)
+
+
+obs_sample <- sars_cov %>%
+  filter(between(Days_from_onset, 0, 30)) %>%
+  group_by(Days_from_onset, Sample_type) %>%
+  summarise(
+    Total_positive = sum(Culture_positive),
+    Total_N = sum(N),
+    Proportion = Total_positive / Total_N,
+    .groups = "drop"
+  )
+
+
+# ------------------------------------------------------------
+# COMBINE PREDICTIONS AND OBSERVED DATA
 # ------------------------------------------------------------
 
 cov_pred <- bind_rows(
-  
+  pred_variant %>%
+    transmute(
+      Days_from_onset, pred, lower, upper,
+      Group = as.character(Variant), Panel = "A"
+    ),
+
   pred_sample %>%
     transmute(
-      Days_from_onset,
-      pred,
-      lower,
-      upper,
-      Group = as.character(Sample_type),
-      Panel = "A"
-    ),
-  
-  pred_vac %>%
-    transmute(
-      Days_from_onset,
-      pred,
-      lower,
-      upper,
-      Group = ifelse(
-        Vaccination_proportion == 0,
-        "0% vaccinated",
-        "100% vaccinated"
-      ),
-      Panel = "B"
+      Days_from_onset, pred, lower, upper,
+      Group = as.character(Sample_type), Panel = "B"
     )
-  
 )
 
-
-# ------------------------------------------------------------
-# COMBINE OBSERVED DOTS
-# ------------------------------------------------------------
 
 cov_obs <- bind_rows(
-  
+  obs_variant %>%
+    transmute(
+      Days_from_onset, Proportion, Total_N,
+      Group = as.character(Variant), Panel = "A"
+    ),
+
   obs_sample %>%
     transmute(
-      Days_from_onset,
-      Proportion,
-      Total_N,
-      Group = as.character(Sample_type),
-      Panel = "A"
-    ),
-  
-  obs_vac %>%
-    transmute(
-      Days_from_onset,
-      Proportion,
-      Total_N,
-      Group = ifelse(
-        Vaccination_proportion == 0,
-        "0% vaccinated",
-        "100% vaccinated"
-      ),
-      Panel = "B"
+      Days_from_onset, Proportion, Total_N,
+      Group = as.character(Sample_type), Panel = "B"
     )
-  
 )
 
 
-panel_order <- c("A", "B")
+group_levels <- c(variant_levels, sample_levels)
+
+cov_pred <- cov_pred %>%
+  mutate(
+    Group = factor(Group, levels = group_levels),
+    Panel = factor(Panel, levels = c("A", "B"))
+  )
+
+cov_obs <- cov_obs %>%
+  mutate(
+    Group = factor(Group, levels = group_levels),
+    Panel = factor(Panel, levels = c("A", "B"))
+  )
 
 
-cov_pred$Panel <- factor(
-  cov_pred$Panel,
-  levels = panel_order
+group_colors <- c(
+  "Early pandemic strain" = "#E76F51",
+  "Delta" = "#E9A23B",
+  "Mixed" = "#8D80C9",
+  "Omicron" = "#3B82B8",
+  "Upper respiratory tract" = "#DC5CE6",
+  "Lower respiratory tract" = "#00B884",
+  "Saliva" = "#00A5E9"
 )
 
-
-cov_obs$Panel <- factor(
-  cov_obs$Panel,
-  levels = panel_order
-)
+group_colors <- group_colors[group_levels]
 
 
 # ------------------------------------------------------------
-# CREATE COMBINED FIGURE
+# PLOT FIGURE 3
 # ------------------------------------------------------------
 
 plot_covariates <- ggplot() +
-  
+
   geom_ribbon(
     data = cov_pred,
     aes(
@@ -1166,10 +692,10 @@ plot_covariates <- ggplot() +
       fill = Group,
       group = Group
     ),
-    alpha = 0.15,
+    alpha = 0.13,
     color = NA
   ) +
-  
+
   geom_line(
     data = cov_pred,
     aes(
@@ -1180,7 +706,7 @@ plot_covariates <- ggplot() +
     ),
     linewidth = 1.2
   ) +
-  
+
   geom_point(
     data = cov_obs,
     aes(
@@ -1189,210 +715,119 @@ plot_covariates <- ggplot() +
       color = Group,
       size = Total_N
     ),
-    alpha = 0.7
+    alpha = 0.65
   ) +
-  
-  geom_hline(
-    yintercept = 0.05,
-    linetype = "dashed"
-  ) +
-  
-  geom_hline(
-    yintercept = 0.01,
-    linetype = "dotted"
-  ) +
-  
-  facet_wrap(
-    ~ Panel,
-    nrow = 1
-  ) +
-  
-  scale_x_continuous(
-    breaks = seq(0, 30, 5)
-  ) +
-  
-  scale_y_continuous(
-    breaks = seq(0, 1, 0.25)
-  ) +
-  
+
+  geom_hline(yintercept = 0.05, linetype = "dashed") +
+  geom_hline(yintercept = 0.01, linetype = "dotted") +
+
+  facet_wrap(~Panel, nrow = 1) +
+
+  scale_color_manual(values = group_colors) +
+  scale_fill_manual(values = group_colors) +
+
+  scale_x_continuous(breaks = seq(0, 30, 5)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.25)) +
+
   scale_size_continuous(
-    range = c(2, 7)
+    range = c(2, 7),
+    breaks = c(100, 200, 300, 400)
   ) +
-  
-  coord_cartesian(
-    xlim = c(0, 30),
-    ylim = c(0, 1)
-  ) +
-  
+
+  coord_cartesian(xlim = c(0, 30), ylim = c(0, 1)) +
+
   labs(
     x = "Days from symptom onset",
     y = "Probability of positive virus culture",
-    
-    # Legend labels
     color = "Group",
     fill = "Group",
     size = "Number tested"
   ) +
-  
+
   theme_classic(base_size = 13) +
-  
+
   theme(
     strip.background = element_blank(),
-    
-    # UPDATED: A and B at top-left
     strip.text.x = element_text(
-      face = "bold",
-      size = 13,
-      hjust = 0
+      face = "bold", size = 14, hjust = 0
     ),
-    
-    panel.border = element_rect(
-      color = "black",
-      fill = NA
-    ),
-    
+    panel.border = element_rect(color = "black", fill = NA),
     panel.spacing = grid::unit(0.8, "lines"),
-    
-    # UPDATED: Legends on the right
     legend.position = "right",
-    
     legend.title = element_text(size = 11),
     legend.text = element_text(size = 10),
-    
-    legend.key.height = grid::unit(
-      0.6,
-      "cm"
-    )
+    legend.key.height = grid::unit(0.6, "cm")
   )
-
 
 print(plot_covariates)
 
 
-# UPDATED: Smaller figure width
-ggsave(
-  file.path(
-    output_dir,
-    "Figure_S1_combined_covariates.png"
+# ============================================================
+# 9. I9 COVARIATE-SPECIFIC THRESHOLDS
+# ============================================================
+
+I9_thresholds <- bind_rows(
+  lapply(
+    split(pred_variant, pred_variant$Variant),
+    function(x) threshold_table(
+      x, as.character(x$Variant[1])
+    )
   ),
-  plot = plot_covariates,
-  width = 9.5,
-  height = 5,
-  dpi = 600
+
+  lapply(
+    split(pred_sample, pred_sample$Sample_type),
+    function(x) threshold_table(
+      x, as.character(x$Sample_type[1])
+    )
+  )
 )
 
-
-ggsave(
-  filename = file.path(output_dir, "Figure_S1_combined_covariates.pdf"),
-  plot = plot_covariates,
-  device = cairo_pdf,
-  width = 9.5,
-  height = 5,
-  units = "in"
-)
-
-write.csv(
-  pred_sample,
-  file.path(output_dir, "predicted_specimen_type.csv"),
-  row.names = FALSE
-)
-
-
-write.csv(
-  pred_vac,
-  file.path(output_dir, "predicted_vaccination_0_100.csv"),
-  row.names = FALSE
-)
+print(I9_thresholds)
 
 
 # ============================================================
-# 12. SUPPLEMENTARY FIGURE S2
-# STUDY-SPECIFIC PREDICTIONS
-#
-# A: SARS-CoV-2
-# B: Influenza
-# C: RSV
-#
-# All trajectories span day 0-30.
-# No observed dots or study labels.
-# Panel labels top-left.
+# 10. STUDY-SPECIFIC PREDICTIONS
 # ============================================================
 
 study_curves <- function(model, virus) {
-  
-  study_ids <- levels(
-    getME(model, "flist")$Cov.id
-  )
-  
+  study_ids <- levels(getME(model, "flist")$Cov.id)
+
   grid <- expand.grid(
     Days_from_onset = seq(0, 30, by = 0.1),
     Cov.id = study_ids
   )
-  
-  grid$Cov.id <- factor(
-    grid$Cov.id,
-    levels = study_ids
-  )
-  
-  # Includes fitted study-specific random effects
-  
+
+  grid$Cov.id <- factor(grid$Cov.id, levels = study_ids)
+
   grid$pred <- predict(
     model,
     newdata = grid,
     type = "response",
     re.form = NULL
   )
-  
+
   grid$Virus <- virus
-  
   grid
 }
 
 
 pred_study <- bind_rows(
-  
-  study_curves(
-    Model_sars,
-    "SARS-CoV-2"
-  ),
-  
-  study_curves(
-    Model_flu,
-    "Influenza"
-  ),
-  
-  study_curves(
-    Model_rsv,
-    "RSV"
+  study_curves(Model_sars, "SARS-CoV-2"),
+  study_curves(Model_flu, "Influenza"),
+  study_curves(Model_rsv, "RSV")
+) %>%
+  mutate(
+    Panel = factor(
+      Virus,
+      levels = virus_levels,
+      labels = c("A", "B", "C")
+    ),
+    line_id = paste(Virus, Cov.id, sep = "_")
   )
-  
-)
 
 
-pred_study$Panel <- factor(
-  pred_study$Virus,
-  levels = virus_levels,
-  labels = c("A", "B", "C")
-)
+plot_study <- ggplot() +
 
-
-# Unique line ID for each study
-
-pred_study$line_id <- paste(
-  pred_study$Virus,
-  pred_study$Cov.id,
-  sep = "_"
-)
-
-
-# ------------------------------------------------------------
-# PLOT STUDY-SPECIFIC CURVES
-# ------------------------------------------------------------
-
-plot_study_abc <- ggplot() +
-  
-  # Grey lines = individual studies
-  
   geom_line(
     data = pred_study,
     aes(
@@ -1404,109 +839,42 @@ plot_study_abc <- ggplot() +
     alpha = 0.55,
     linewidth = 0.65
   ) +
-  
-  # Purple line = overall fixed-effect prediction
-  
+
   geom_line(
     data = all_pred,
-    aes(
-      x = Days_from_onset,
-      y = pred
-    ),
+    aes(Days_from_onset, pred),
     color = "#800080",
     linewidth = 1.4
   ) +
-  
-  geom_hline(
-    yintercept = 0.05,
-    linetype = "dashed"
-  ) +
-  
-  geom_hline(
-    yintercept = 0.01,
-    linetype = "dotted"
-  ) +
-  
-  facet_wrap(
-    ~ Panel,
-    nrow = 1
-  ) +
-  
-  scale_x_continuous(
-    breaks = seq(0, 30, 5)
-  ) +
-  
-  scale_y_continuous(
-    breaks = seq(0, 1, 0.25)
-  ) +
-  
-  coord_cartesian(
-    xlim = c(0, 30),
-    ylim = c(0, 1)
-  ) +
-  
+
+  geom_hline(yintercept = 0.05, linetype = "dashed") +
+  geom_hline(yintercept = 0.01, linetype = "dotted") +
+
+  facet_wrap(~Panel, nrow = 1) +
+
+  scale_x_continuous(breaks = seq(0, 30, 5)) +
+  scale_y_continuous(breaks = seq(0, 1, 0.25)) +
+
+  coord_cartesian(xlim = c(0, 30), ylim = c(0, 1)) +
+
   labs(
     x = "Days from symptom onset",
     y = "Probability of positive virus culture"
   ) +
-  
+
   theme_classic(base_size = 14) +
-  
+
   theme(
     strip.background = element_blank(),
-    
-    # UPDATED: A, B, C aligned top-left
-    strip.text.x = element_text(
-      face = "bold",
-      hjust = 0
-    ),
-    
-    panel.border = element_rect(
-      color = "black",
-      fill = NA
-    ),
-    
-    panel.spacing = grid::unit(1.2, "lines")
+    strip.text.x = element_text(face = "bold", hjust = 0),
+    panel.border = element_rect(color = "black", fill = NA)
   )
 
-
-print(plot_study_abc)
-
-
-ggsave(
-  file.path(
-    output_dir,
-    "Figure_S2_study_specific_ABC.png"
-  ),
-  plot = plot_study_abc,
-  width = 11,
-  height = 4.5,
-  dpi = 600
-)
-
-ggsave(
-  filename = file.path(output_dir, "Figure_S2_study_specific_ABC.pdf"),
-  plot = plot_study_abc,
-  device = cairo_pdf,
-  width = 11,
-  height = 4.5,
-  units = "in"
-)
-
-
-write.csv(
-  pred_study,
-  file.path(
-    output_dir,
-    "predicted_study_specific_0_30.csv"
-  ),
-  row.names = FALSE
-)
+print(plot_study)
 
 
 # ============================================================
-# 13. CLOGLOG SENSITIVITY ANALYSIS
-# NO PLOT
+# 11. CLOGLOG SENSITIVITY ANALYSIS
 # ============================================================
 
 Model_sars_cloglog <- fit_model(
@@ -1518,134 +886,33 @@ Model_sars_cloglog <- fit_model(
 )
 
 
-# Check convergence
-
-cloglog_messages <-
-  Model_sars_cloglog@optinfo$conv$lme4$messages
-
-
-print(cloglog_messages)
-
-
 cloglog_comparison <- data.frame(
-  
-  Model = c(
-    "Logit (primary)",
-    "Cloglog (sensitivity)"
-  ),
-  
-  AIC = round(
-    c(
-      AIC(Model_sars),
-      AIC(Model_sars_cloglog)
-    ),
-    1
-  ),
-  
-  BIC = round(
-    c(
-      BIC(Model_sars),
-      BIC(Model_sars_cloglog)
-    ),
-    1
-  ),
-  
-  Singular_fit = c(
+  Model = c("Logit", "Cloglog"),
+  AIC = c(AIC(Model_sars), AIC(Model_sars_cloglog)),
+  BIC = c(BIC(Model_sars), BIC(Model_sars_cloglog)),
+  Singular = c(
     isSingular(Model_sars),
     isSingular(Model_sars_cloglog)
-  ),
-  
-  Convergence_warning = c(
-    !is.null(Model_sars@optinfo$conv$lme4$messages),
-    !is.null(cloglog_messages)
   )
-  
 )
-
 
 print(cloglog_comparison)
 
 
-write.csv(
-  cloglog_comparison,
-  file.path(
-    output_dir,
-    "cloglog_sensitivity_comparison.csv"
+cloglog_thresholds <- bind_rows(
+  threshold_table(
+    make_pred(Model_sars, sars, "Logit", 60),
+    "Logit"
   ),
-  row.names = FALSE
+  threshold_table(
+    make_pred(Model_sars_cloglog, sars, "Cloglog", 60),
+    "Cloglog"
+  )
 )
 
-
-# Calculate cloglog threshold results only if
-# no convergence warning is reported.
-
-if (is.null(cloglog_messages)) {
-  
-  pred_cloglog <- make_pred(
-    Model_sars_cloglog,
-    sars,
-    "SARS-CoV-2 (cloglog)",
-    end_day = 60
-  )
-  
-  sensitivity_thresholds <- bind_rows(
-    
-    threshold_table(
-      make_pred(
-        Model_sars,
-        sars,
-        "SARS-CoV-2 (logit)",
-        end_day = 60
-      ),
-      "Logit"
-    ),
-    
-    threshold_table(
-      pred_cloglog,
-      "Cloglog"
-    )
-    
-  )
-  
-  print(sensitivity_thresholds)
-  
-  write.csv(
-    sensitivity_thresholds,
-    file.path(
-      output_dir,
-      "cloglog_threshold_sensitivity.csv"
-    ),
-    row.names = FALSE
-  )
-  
-} else {
-  
-  warning(
-    "Cloglog convergence warning. ",
-    "Review the model before reporting ",
-    "cloglog threshold uncertainty."
-  )
-  
-}
+print(cloglog_thresholds)
 
 
 # ============================================================
-# 14. FINAL EXPORT
+# END
 # ============================================================
-
-write.csv(
-  all_pred,
-  file.path(
-    output_dir,
-    "predicted_all_viruses.csv"
-  ),
-  row.names = FALSE
-)
-
-
-cat("\n====================================\n")
-cat("ANALYSIS COMPLETED\n")
-cat("====================================\n")
-
-cat("\nAll outputs saved in:\n")
-print(normalizePath(output_dir))
